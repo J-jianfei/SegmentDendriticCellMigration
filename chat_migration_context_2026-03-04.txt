@@ -1,0 +1,209 @@
+Dendritic Cell Migration Pipeline - Conversation Context Export
+Date: 2026-03-04
+Project root: /home/jianfei/SegmentAnything
+Working folder used: /home/jianfei/SegmentAnything/DendriticCellTest
+
+1) Session-level context
+- You asked for an end-to-end pipeline around SAM3-based video segmentation, preprocessing, tracking, and polarity modeling.
+- Main raw/processed data root used throughout: /mnt/Files/Dendritic_Cells/Migration
+- SAM model path used: /home/jianfei/SegmentAnything/sam3.pt
+- Goal emphasis: quantify migrating dendritic-cell behavior, especially polarity as movement direction, with WT vs MyoKO separation.
+
+2) Key scripts and what they do
+
+2.1 Video preparation from TIFF
+File: /home/jianfei/SegmentAnything/DendriticCellTest/prepare_sam3_data.py
+File: /home/jianfei/SegmentAnything/DendriticCellTest/batch_prepare_sam3_from_parent.sh
+
+Implemented features:
+- Converts multi-channel TIFF to RGB MP4 for SAM3 input.
+- Brightfield + one/more label channels are composited.
+- Output naming includes label suffix from first label name:
+  - Example: if label is "pv", output is <stem>_pv.mp4
+- Output path behavior unchanged (same target folder logic), only suffix appended.
+- ImageJ/FIJI-like brightness/contrast (B/C) controls added:
+  - Global: --bc-brightness, --bc-contrast
+  - Per channel: --bc-channel TARGET:BRIGHTNESS:CONTRAST
+  - TARGET can be brightfield, label name, or channel index.
+- If B/C is set without explicit --normalize, script auto-switches to --normalize minmax for ImageJ-like behavior.
+
+Typical command pattern:
+/home/jianfei/SegmentAnything/DendriticCellTest/batch_prepare_sam3_from_parent.sh \
+  /mnt/Files/Dendritic_Cells \
+  /mnt/Files/Dendritic_Cells/Migration \
+  0 \
+  --label pv:2:red \
+  --bc-channel brightfield:50:50 \
+  --bc-channel pv:51:71
+
+Notes:
+- Your manual ImageJ comparison reference files:
+  - /mnt/Files/Dendritic_Cells/Migration/20240719_Agarose2-TFM_BMDCd10-toxo_MyoKOvsWT_raw/WT10_pv.mp4
+  - /mnt/Files/Dendritic_Cells/Migration/20240719_Agarose2-TFM_BMDCd10-toxo_MyoKOvsWT_raw/WT10_pv_manual.avi
+
+2.2 SAM3 segmentation on MP4
+File: /home/jianfei/SegmentAnything/DendriticCellTest/test_sam3_video.py
+
+Implemented features:
+- Recursively segments MP4 files under a root (default: /mnt/Files/Dendritic_Cells/Migration).
+- Supports multiple text prompts by repeating --prompt.
+- Writes per-video CSV and prediction video next to each MP4.
+- Prediction output default is AVI to avoid MP4 codec incompatibility.
+  - pred suffix default: _pred
+  - pred extension default: .avi
+
+CSV fields per segmented object row:
+- frame_index
+- obj_id
+- class_id
+- class_name
+- x
+- y
+- width
+- height
+- segment_score
+- fov_width
+- fov_height
+
+Behavior on rerun:
+- Existing per-video CSV and prediction file are overwritten (same filename, write mode).
+
+Multiple prompt example:
+python /home/jianfei/SegmentAnything/DendriticCellTest/test_sam3_video.py \
+  --video-root /mnt/Files/Dendritic_Cells/Migration \
+  --model /home/jianfei/SegmentAnything/sam3.pt \
+  --prompt "migrating dendritic cells" \
+  --prompt "parasite vacuole in red"
+
+2.3 Aggregate per-video PV CSVs
+File: /home/jianfei/SegmentAnything/DendriticCellTest/aggregate_pv_csv.py
+
+Implemented features:
+- Aggregates *_pv.csv into one CSV.
+- Preserves original columns.
+- Adds FULL_PATH_TO_RAW_DATA for every row (points to same-stem MP4 path).
+- Default output: /mnt/Files/Dendritic_Cells/Migration/all_pv_segmented.csv
+
+2.4 Preprocessing before tracking
+File: /home/jianfei/SegmentAnything/DendriticCellTest/preprocess_tracking_csv.py
+
+Implemented pipeline (based on your selected items):
+- Edge/FOV boundary exclusion (omit objects touching edges, margin configurable).
+- In-frame duplicate suppression (IoU/containment/distance criteria).
+- Temporal persistence filtering (short proto-tracks can be dropped).
+- PV-cell spatial constraint (PV linked to cell context; configurable behavior).
+- Optional confidence filtering (global or class-specific).
+- Optional drift correction flag exists (not forced).
+
+Outputs:
+- Per-file preprocessed CSVs with suffix (default _preprocessed).
+- Aggregate preprocessed CSV (default /mnt/Files/Dendritic_Cells/Migration/all_pv_preprocessed.csv).
+- Drop-log CSV for removed detections.
+
+2.5 Tracking (Hungarian / linear assignment)
+File: /home/jianfei/SegmentAnything/DendriticCellTest/track_preprocessed_csv.py
+
+Implemented features:
+- Multi-object tracking using linear assignment (scipy Hungarian algorithm).
+- Grouped by source video and class.
+- Produces track_id and track metadata.
+- Added pv_size for each cell track row:
+  - pv_size = sum of PV areas assigned to that cell in same frame
+  - if no PV assigned, pv_size = 0
+- Default aggregate output: /mnt/Files/Dendritic_Cells/Migration/all_pv_tracked.csv
+
+2.6 Directional polarity analysis
+File: /home/jianfei/SegmentAnything/DendriticCellTest/analyze_direction_polarity.py
+
+Implemented concept:
+- Polarity defined as movement direction (unit velocity), not fixed ex/ey axis.
+- Computes directional autocorrelation vs lag.
+- Computes track-wise metrics (resultant length, mean_cos_turn, reversal fraction, etc.).
+- Supports WT vs MyoKO separation via filename-regex labeling.
+
+3) Modeling work (data-driven polarity + mesoscopic coupling)
+
+Primary model file:
+/home/jianfei/SegmentAnything/DendriticCellTest/fit_data_driven_polarity_mesoscopic.py
+
+Major implemented upgrades:
+- Multi-site polarity (multiple simultaneous active polarity sites).
+- Empirical renewal process from data:
+  - Inter-birth intervals sampled from observed turning-event intervals.
+  - Site lifetimes sampled from observed segment lengths (scaled by lifetime_scale).
+- Source field = weighted sum of active site kernels (age weighting + clipping).
+- Added slow trajectory-level bias dynamics to improve directionality matching:
+  - bias_align
+  - bias_diffusion
+- Coupled to activator/actin/myosin/mechanics model and exports comparison outputs.
+
+Current default tuned parameters in script (as of this export):
+- turn_event_thresh_deg = 61.65
+- source_kappa = 28.72
+- max_active_sites = 3
+- lifetime_scale = 2.99
+- source_age_power = 1.07
+- source_clip = 1.25
+- poly_base = 0.0784
+- poly_source_gain = 1.3234
+- beta_f = 0.3488
+- beta_m = 0.4318
+- bias_align = 0.3476
+- bias_diffusion = 0.0363
+
+Main output folder currently used:
+/mnt/Files/Dendritic_Cells/Migration/data_driven_polarity_mesoscopic
+
+Main outputs there:
+- data_driven_polarity_fit.json
+- coupled_mesoscopic_simulation_timeseries.csv
+- coupled_mesoscopic_profile_summary.csv
+- coupled_mesoscopic_autocorr_compare.csv
+- coupled_mesoscopic_track_metrics_compare.csv
+- coupled_mesoscopic_polarity_compare.png
+
+Latest observed vs simulated summary (from data_driven_polarity_fit.json):
+Observed:
+- n_tracks: 406
+- mean_resultant_length: 0.5084745516419134
+- mean_cos_turn: 0.5666527086043424
+- mean_reversal_fraction: 0.174924950913356
+
+Simulated:
+- n_trajectories: 120
+- mean_resultant_length: 0.4941068060268733
+- mean_cos_turn: 0.5911311156295002
+- mean_reversal_fraction: 0.17943921898852638
+- mean_active_sites: 2.0666058394160585
+- mean_births_per_step: 0.2572992700729927
+- mean_deaths_per_step: 0.22749391727493917
+- autocorr_rmse: 0.06343203125142283
+
+4) Current status and open issue
+- Trend alignment improved substantially vs earlier versions.
+- Remaining mismatch: short-lag directional autocorrelation (lags 1-4) is still somewhat too persistent in simulation.
+- Directionality is close but not exact.
+- Suggested next step from last discussion:
+  - run one more constrained optimization pass emphasizing lag 1-4 fit while enforcing resultant length near observed (~0.5085).
+
+5) Paper/model context discussed
+- /home/jianfei/SegmentAnything/DendriticCellTest/A_mesoscopic_model_for_amoeboid_cell_migration_with_intracellular_dynamics.pdf
+- /home/jianfei/SegmentAnything/DendriticCellTest/PhysRevE94042423.pdf
+
+High-level modeling conclusion used:
+- Pure single-site polarity over-locks direction.
+- Multi-site + empirical renewal better captures intermittent repolarization.
+- Additional slow-bias state helps match track-level directionality without only inflating persistence.
+
+6) Important paths quick list
+- Model checkpoint: /home/jianfei/SegmentAnything/sam3.pt
+- Prep script: /home/jianfei/SegmentAnything/DendriticCellTest/prepare_sam3_data.py
+- Batch prep wrapper: /home/jianfei/SegmentAnything/DendriticCellTest/batch_prepare_sam3_from_parent.sh
+- Segmentation script: /home/jianfei/SegmentAnything/DendriticCellTest/test_sam3_video.py
+- Aggregator: /home/jianfei/SegmentAnything/DendriticCellTest/aggregate_pv_csv.py
+- Preprocess: /home/jianfei/SegmentAnything/DendriticCellTest/preprocess_tracking_csv.py
+- Tracking: /home/jianfei/SegmentAnything/DendriticCellTest/track_preprocessed_csv.py
+- Direction analysis: /home/jianfei/SegmentAnything/DendriticCellTest/analyze_direction_polarity.py
+- Data-driven mesoscopic fit: /home/jianfei/SegmentAnything/DendriticCellTest/fit_data_driven_polarity_mesoscopic.py
+
+End of context export.

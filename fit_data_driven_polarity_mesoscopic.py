@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--turn-event-thresh-deg",
         type=float,
-        default=45.0,
+        default=61.65,
         help="Turning-angle threshold (deg) for polarity event detection.",
     )
     p.add_argument("--max-lag", type=int, default=20, help="Max lag for autocorrelation comparison.")
@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--source-kappa",
         type=float,
-        default=16.0,
+        default=28.72,
         help="Concentration of polarity source profile on membrane (von Mises style).",
     )
     p.add_argument(
@@ -131,25 +131,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-active-sites",
         type=int,
-        default=8,
+        default=3,
         help="Maximum number of simultaneously active polarity sites.",
     )
     p.add_argument(
         "--lifetime-scale",
         type=float,
-        default=1.25,
+        default=2.99,
         help="Multiplier on empirical polarity-site lifetime to permit overlap between sites.",
     )
     p.add_argument(
         "--source-age-power",
         type=float,
-        default=1.0,
+        default=1.07,
         help="Exponent for age weighting of each active site contribution to source profile.",
     )
     p.add_argument(
         "--source-clip",
         type=float,
-        default=2.0,
+        default=1.25,
         help="Upper clip for summed multi-site source field; set <=0 to disable clipping.",
     )
 
@@ -167,8 +167,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--Kg", type=float, default=0.6, help="G-actin half-saturation.")
     p.add_argument("--Kf", type=float, default=0.9, help="F-actin inhibition half-saturation.")
     p.add_argument("--hill-n", type=float, default=2.0, help="Hill exponent.")
-    p.add_argument("--poly-base", type=float, default=0.10, help="Baseline polymerization drive.")
-    p.add_argument("--poly-source-gain", type=float, default=0.90, help="Polarity-source gain on polymerization.")
+    p.add_argument("--poly-base", type=float, default=0.0784, help="Baseline polymerization drive.")
+    p.add_argument("--poly-source-gain", type=float, default=1.3234, help="Polarity-source gain on polymerization.")
     p.add_argument("--actin-total", type=float, default=1.8, help="Initial mean F+G actin total.")
     p.add_argument("--f0", type=float, default=0.65, help="Initial F-actin baseline.")
 
@@ -185,12 +185,24 @@ def parse_args() -> argparse.Namespace:
     # Mechanics
     p.add_argument("--k-r", type=float, default=0.40, help="Radial elastic stiffness to reference radius.")
     p.add_argument("--D-r", type=float, default=0.03, help="Radial smoothing diffusion on membrane.")
-    p.add_argument("--beta-f", type=float, default=0.35, help="F-actin protrusive coefficient.")
-    p.add_argument("--beta-m", type=float, default=0.50, help="Myosin contractile coefficient.")
+    p.add_argument("--beta-f", type=float, default=0.3488, help="F-actin protrusive coefficient.")
+    p.add_argument("--beta-m", type=float, default=0.4318, help="Myosin contractile coefficient.")
     p.add_argument("--drag", type=float, default=45.0, help="Translational drag.")
     p.add_argument("--r-min", type=float, default=0.45, help="Minimum local radius clamp.")
     p.add_argument("--r-max", type=float, default=1.70, help="Maximum local radius clamp.")
     p.add_argument("--center-step-eps", type=float, default=1e-6, help="Minimum center step for direction stats.")
+    p.add_argument(
+        "--bias-align",
+        type=float,
+        default=0.3476,
+        help="Strength of slow trajectory-level directional bias on polarity angle.",
+    )
+    p.add_argument(
+        "--bias-diffusion",
+        type=float,
+        default=0.0363,
+        help="Diffusion scale for the slow trajectory-level bias direction.",
+    )
 
     return p.parse_args()
 
@@ -203,6 +215,20 @@ def circ_mean(angles: np.ndarray) -> float:
     if len(angles) == 0:
         return 0.0
     return float(np.angle(np.mean(np.exp(1j * angles))))
+
+
+def circ_mean_weighted(angles: np.ndarray, weights: np.ndarray) -> float:
+    if len(angles) == 0:
+        return 0.0
+    w = np.asarray(weights, dtype=float)
+    if len(w) != len(angles):
+        raise ValueError("angles and weights must have the same length")
+    if np.sum(w) <= 1e-12:
+        return circ_mean(angles)
+    z = np.sum(w * np.exp(1j * angles))
+    if abs(z) <= 1e-12:
+        return circ_mean(angles)
+    return float(np.angle(z))
 
 
 def periodic_laplacian(v: np.ndarray) -> np.ndarray:
@@ -303,6 +329,8 @@ def segment_track(theta: np.ndarray, turn_event_thresh_rad: float) -> list[tuple
 def fit_polarity_from_tracks(tracks: list[TrackSeries], dt: float, turn_event_thresh_deg: float) -> PolarityFit:
     turn_event_thresh_rad = math.radians(float(turn_event_thresh_deg))
     all_segment_lengths: list[int] = []
+    all_inter_birth_steps: list[int] = []
+    all_life_steps: list[int] = []
     all_jump_angles: list[float] = []
     all_y_t: list[float] = []
     all_y_tp1: list[float] = []
@@ -312,11 +340,24 @@ def fit_polarity_from_tracks(tracks: list[TrackSeries], dt: float, turn_event_th
     for tr in tracks:
         theta = tr.theta
         total_steps += len(theta)
+        event_idx = turn_event_indices(theta, turn_event_thresh_rad=turn_event_thresh_rad)
+        n_events += int(len(event_idx))
+
+        # Births are observed as large-turn events.
+        # Use empirical event intervals as the renewal pool.
+        if len(event_idx) >= 1:
+            birth_times = np.concatenate(([0], event_idx.astype(int)))
+            intervals = np.diff(birth_times)
+            for k in intervals.tolist():
+                if int(k) > 0:
+                    all_inter_birth_steps.append(int(k))
+
         segs = segment_track(theta, turn_event_thresh_rad=turn_event_thresh_rad)
         if not segs:
             continue
-        all_segment_lengths.extend([e - s for s, e in segs])
-        n_events += max(0, len(segs) - 1)
+        seg_lengths = [int(e - s) for s, e in segs if (e - s) > 0]
+        all_segment_lengths.extend(seg_lengths)
+        all_life_steps.extend(seg_lengths)
 
         target_angles: list[float] = []
         for s, e in segs:
@@ -333,8 +374,14 @@ def fit_polarity_from_tracks(tracks: list[TrackSeries], dt: float, turn_event_th
     if total_steps <= 0:
         raise RuntimeError("No direction steps available for polarity fitting.")
 
-    alpha_birth = float(max(1e-9, n_events / total_steps))
-    tau_live = float(np.mean(all_segment_lengths)) if all_segment_lengths else 1.0
+    if all_inter_birth_steps:
+        mean_inter_birth = float(np.mean(all_inter_birth_steps))
+        alpha_birth = float(1.0 / max(1e-9, mean_inter_birth))
+    else:
+        alpha_birth = float(max(1e-9, n_events / total_steps))
+        mean_inter_birth = float(1.0 / alpha_birth)
+
+    tau_live = float(np.mean(all_life_steps)) if all_life_steps else (float(np.mean(all_segment_lengths)) if all_segment_lengths else 1.0)
     tau_live = max(1e-6, tau_live)
     p_birth = 1.0 - math.exp(-alpha_birth * dt)
     p_death = 1.0 - math.exp(-dt / tau_live)
@@ -372,6 +419,10 @@ def fit_polarity_from_tracks(tracks: list[TrackSeries], dt: float, turn_event_th
         n_events=int(n_events),
         n_segments=int(len(all_segment_lengths)),
         median_segment_len=float(np.median(all_segment_lengths)) if all_segment_lengths else 0.0,
+        mean_inter_birth_steps=mean_inter_birth,
+        mean_life_steps=float(np.mean(all_life_steps)) if all_life_steps else tau_live,
+        inter_birth_steps=[int(x) for x in all_inter_birth_steps if int(x) > 0],
+        life_steps=[int(x) for x in all_life_steps if int(x) > 0],
         jump_angles=[float(x) for x in all_jump_angles],
     )
 
@@ -451,7 +502,24 @@ def simulate_coupled_model(
     sim_u_tracks: list[np.ndarray] = []
 
     jump_pool = np.asarray(fit.jump_angles, dtype=float) if fit.jump_angles else np.array([], dtype=float)
+    inter_pool = np.asarray([int(x) for x in fit.inter_birth_steps if int(x) > 0], dtype=int)
+    life_pool = np.asarray([int(x) for x in fit.life_steps if int(x) > 0], dtype=int)
     lengths = track_lengths if len(track_lengths) > 0 else np.array([120], dtype=int)
+    max_active_sites = int(max(1, args.max_active_sites))
+    initial_active_sites = int(max(0, min(args.initial_active_sites, max_active_sites)))
+    life_scale = float(max(1e-6, args.lifetime_scale))
+
+    def sample_inter_birth_steps() -> int:
+        if inter_pool.size > 0:
+            return int(max(1, rng.choice(inter_pool)))
+        return int(max(1, round(fit.mean_inter_birth_steps)))
+
+    def sample_life_steps() -> int:
+        if life_pool.size > 0:
+            base = int(max(1, rng.choice(life_pool)))
+        else:
+            base = int(max(1, round(fit.mean_life_steps)))
+        return int(max(1, round(base * life_scale)))
 
     for sim_id in range(1, n_sims + 1):
         steps = int(args.sim_steps) if int(args.sim_steps) > 0 else int(rng.choice(lengths))
@@ -461,10 +529,25 @@ def simulate_coupled_model(
         center_prev = center.copy()
         center_u: list[np.ndarray] = []
 
-        # polarity state
-        active = False
+        # polarity state with multi-site renewal
         theta = float(rng.uniform(-np.pi, np.pi))
         rprot = theta
+        theta_bias = float(rng.uniform(-np.pi, np.pi))
+        active_sites: list[dict[str, float]] = []
+        for _ in range(initial_active_sites):
+            life = float(sample_life_steps())
+            if active_sites:
+                base = rprot
+                if jump_pool.size > 0:
+                    angle = float(wrap_pi(base + float(rng.choice(jump_pool))))
+                else:
+                    angle = float(wrap_pi(base + rng.normal(scale=max(0.25, 2.0 * ou_step_std))))
+            else:
+                angle = float(rng.uniform(-np.pi, np.pi))
+            active_sites.append({"theta": angle, "life": life, "remaining": life})
+            rprot = circ_mean(np.asarray([s["theta"] for s in active_sites], dtype=float))
+
+        birth_timer = sample_inter_birth_steps()
 
         # membrane and biochemical fields
         r = np.full(node_n, float(args.r0), dtype=float)
@@ -475,28 +558,62 @@ def simulate_coupled_model(
         Mb = np.full(node_n, max(1e-6, float(args.myosin_total) - float(args.ma0)), dtype=float)
 
         for t in range(steps):
-            birth = False
-            death = False
+            birth_count = 0
+            death_count = 0
+            birth_timer -= 1
 
-            if rng.random() < fit.p_birth:
-                birth = True
-                active = True
-                if jump_pool.size > 0:
-                    jump = float(rng.choice(jump_pool))
-                    rprot = float(wrap_pi(rprot + jump))
+            if birth_timer <= 0:
+                if len(active_sites) < max_active_sites:
+                    base = rprot if active_sites else theta
+                    if jump_pool.size > 0:
+                        new_theta = float(wrap_pi(base + float(rng.choice(jump_pool))))
+                    else:
+                        new_theta = float(wrap_pi(base + rng.normal(scale=max(0.25, 2.0 * ou_step_std))))
+                    new_life = float(sample_life_steps())
+                    active_sites.append({"theta": new_theta, "life": new_life, "remaining": new_life})
+                    birth_count += 1
+                birth_timer += sample_inter_birth_steps()
+
+            active_count = len(active_sites)
+            if active_count > 0:
+                site_angles = np.asarray([s["theta"] for s in active_sites], dtype=float)
+                if float(args.source_age_power) == 0.0:
+                    site_weights = np.ones(active_count, dtype=float)
                 else:
-                    rprot = float(rng.uniform(-np.pi, np.pi))
+                    site_weights = []
+                    for s in active_sites:
+                        rem_frac = float(np.clip(s["remaining"] / max(1e-9, s["life"]), 0.0, 1.0))
+                        site_weights.append(rem_frac ** float(args.source_age_power))
+                    site_weights = np.asarray(site_weights, dtype=float)
+                    if np.sum(site_weights) <= 1e-12:
+                        site_weights = np.ones(active_count, dtype=float)
 
-            if active and (not birth) and (rng.random() < fit.p_death):
-                death = True
-                active = False
-
-            if active:
-                theta = float(wrap_pi(rprot + fit.rho_ou * wrap_pi(theta - rprot) + ou_step_std * rng.normal()))
+                rprot = circ_mean_weighted(site_angles, site_weights)
+                source = np.zeros(node_n, dtype=float)
+                for ang, w in zip(site_angles, site_weights):
+                    source += float(w) * vm_source_profile(node_angles=node_angles, theta=float(ang), kappa=float(args.source_kappa))
+                if float(args.source_clip) > 0:
+                    source = np.clip(source, 0.0, float(args.source_clip))
+                theta_bias = float(wrap_pi(theta_bias + float(args.bias_diffusion) * rng.normal()))
+                theta = float(
+                    wrap_pi(
+                        rprot
+                        + fit.rho_ou * wrap_pi(theta - rprot)
+                        + float(args.bias_align) * wrap_pi(theta_bias - theta)
+                        + ou_step_std * rng.normal()
+                    )
+                )
             else:
-                theta = float(wrap_pi(theta + 0.5 * ou_step_std * rng.normal()))
-
-            source = vm_source_profile(node_angles=node_angles, theta=theta, kappa=float(args.source_kappa)) if active else np.zeros(node_n, dtype=float)
+                source = np.zeros(node_n, dtype=float)
+                rprot = theta
+                theta_bias = float(wrap_pi(theta_bias + float(args.bias_diffusion) * rng.normal()))
+                theta = float(
+                    wrap_pi(
+                        theta
+                        + float(args.bias_align) * wrap_pi(theta_bias - theta)
+                        + 0.5 * ou_step_std * rng.normal()
+                    )
+                )
 
             lap_a = periodic_laplacian(a)
             a = a + dt * (float(args.Da) * lap_a - float(args.ra) * a + float(args.ba) * source * (float(args.amax) - a))
@@ -556,6 +673,15 @@ def simulate_coupled_model(
                 center_u.append(dcenter / speed)
             center_prev = center.copy()
 
+            survivors: list[dict[str, float]] = []
+            for s in active_sites:
+                s["remaining"] -= 1.0
+                if s["remaining"] > 0:
+                    survivors.append(s)
+                else:
+                    death_count += 1
+            active_sites = survivors
+
             sim_rows.append(
                 dict(
                     sim_id=sim_id,
@@ -564,9 +690,11 @@ def simulate_coupled_model(
                     center_y=float(center[1]),
                     theta=float(theta),
                     rprot=float(rprot),
-                    active=int(active),
-                    birth=int(birth),
-                    death=int(death),
+                    theta_bias=float(theta_bias),
+                    active=int(active_count),
+                    active_after=int(len(active_sites)),
+                    birth=int(birth_count),
+                    death=int(death_count),
                     speed=speed,
                     mean_activator=float(np.mean(a)),
                     mean_F=float(np.mean(F)),
@@ -580,11 +708,12 @@ def simulate_coupled_model(
 
             # keep profile output lightweight
             if (t % 5) == 0:
-                source_idx = int(np.argmax(source)) if active else -1
+                source_idx = int(np.argmax(source)) if active_count > 0 else -1
                 profile_rows.append(
                     dict(
                         sim_id=sim_id,
                         step=t,
+                        active_sites=int(active_count),
                         source_idx=source_idx,
                         source_peak=float(np.max(source)) if source.size else 0.0,
                         F_peak=float(np.max(F)),
@@ -634,6 +763,10 @@ def main() -> int:
             "tau_live_steps": fit.tau_live,
             "p_birth_per_step": fit.p_birth,
             "p_death_per_step": fit.p_death,
+            "mean_inter_birth_steps": fit.mean_inter_birth_steps,
+            "mean_life_steps": fit.mean_life_steps,
+            "n_inter_birth_samples": int(len(fit.inter_birth_steps)),
+            "n_life_samples": int(len(fit.life_steps)),
             "rho_ou": fit.rho_ou,
             "tau_ou_steps": fit.tau_ou,
             "sigma_ou": fit.sigma_ou,
@@ -655,6 +788,9 @@ def main() -> int:
             "mean_resultant_length": float(sim_metrics["resultant_length"].mean()) if len(sim_metrics) else float("nan"),
             "mean_cos_turn": float(sim_metrics["mean_cos_turn"].mean(skipna=True)) if len(sim_metrics) else float("nan"),
             "mean_reversal_fraction": float(sim_metrics["reversal_fraction"].mean(skipna=True)) if len(sim_metrics) else float("nan"),
+            "mean_active_sites": float(sim_df["active"].mean()) if len(sim_df) else float("nan"),
+            "mean_births_per_step": float(sim_df["birth"].mean()) if len(sim_df) else float("nan"),
+            "mean_deaths_per_step": float(sim_df["death"].mean()) if len(sim_df) else float("nan"),
             "autocorr_rmse": ac_rmse,
         },
         "settings": {
@@ -669,6 +805,13 @@ def main() -> int:
             "n_sims": int(args.n_sims),
             "sim_steps": int(args.sim_steps),
             "seed": int(args.seed),
+            "initial_active_sites": int(args.initial_active_sites),
+            "max_active_sites": int(args.max_active_sites),
+            "lifetime_scale": float(args.lifetime_scale),
+            "source_age_power": float(args.source_age_power),
+            "source_clip": float(args.source_clip),
+            "bias_align": float(args.bias_align),
+            "bias_diffusion": float(args.bias_diffusion),
         },
     }
 
@@ -750,6 +893,8 @@ def main() -> int:
     print(f"  tau_live_steps: {fit.tau_live:.6f}")
     print(f"  p_birth_per_step: {fit.p_birth:.6f}")
     print(f"  p_death_per_step: {fit.p_death:.6f}")
+    print(f"  mean_inter_birth_steps: {fit.mean_inter_birth_steps:.6f}")
+    print(f"  mean_life_steps: {fit.mean_life_steps:.6f}")
     print(f"  rho_ou: {fit.rho_ou:.6f}")
     print(f"  tau_ou_steps: {fit.tau_ou:.6f}")
     print(f"  sigma_ou: {fit.sigma_ou:.6f}")
