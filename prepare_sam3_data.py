@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
@@ -23,6 +24,14 @@ class LabelSpec:
     image: np.ndarray | None = None
 
 
+@dataclass
+class ChannelBCOverride:
+    target_type: str  # "brightfield", "label", or "index"
+    target_value: str | int
+    brightness: float
+    contrast: float
+
+
 def parse_label_spec(spec: str) -> Tuple[str, int, str | None]:
     """
     Parse label spec in the form NAME:INDEX or NAME:INDEX:COLOR.
@@ -41,6 +50,30 @@ def parse_label_spec(spec: str) -> Tuple[str, int, str | None]:
     if color and color not in COLOR_TO_CHANNEL:
         raise ValueError(f"Invalid --label '{spec}': COLOR must be red/green/blue")
     return name, index, color
+
+
+def parse_channel_bc_spec(spec: str) -> Tuple[str, float, float]:
+    """
+    Parse per-channel B/C spec in the form TARGET:BRIGHTNESS:CONTRAST.
+    TARGET can be 'brightfield', label name, or channel index.
+    """
+    parts = spec.split(":")
+    if len(parts) != 3:
+        raise ValueError(
+            f"Invalid --bc-channel '{spec}'. "
+            "Use TARGET:BRIGHTNESS:CONTRAST (e.g. brightfield:60:45 or pv:80:90 or 3:40:70)."
+        )
+    target = parts[0].strip()
+    if not target:
+        raise ValueError(f"Invalid --bc-channel '{spec}': empty TARGET")
+    try:
+        brightness = float(parts[1])
+        contrast = float(parts[2])
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --bc-channel '{spec}': BRIGHTNESS and CONTRAST must be numeric percentages"
+        ) from exc
+    return target, brightness, contrast
 
 
 def load_tiff_with_axes(path: Path) -> Tuple[np.ndarray, str | None]:
@@ -165,14 +198,19 @@ def compute_frame_stats(
     return stats
 
 
-def scale_to_uint8(img: np.ndarray, method: str, stats: Tuple[float, float] | None) -> np.ndarray:
-    """Scale a single-channel image to uint8 using precomputed stats."""
+def scale_to_uint8(
+    img: np.ndarray,
+    method: str,
+    stats: Tuple[float, float] | None,
+    bc_brightness: float,
+    bc_contrast: float,
+) -> np.ndarray:
+    """Scale a single-channel image to uint8, then apply ImageJ-like brightness/contrast."""
     if method == "none":
-        if img.dtype == np.uint8:
-            return img
-        img = img.astype(np.float32)
-        img = np.clip(img, 0, 255)
-        return img.astype(np.uint8)
+        base = img.astype(np.float32)
+        base = np.clip(base, 0, 255) / 255.0
+        adjusted = apply_imagej_bc(base, bc_brightness, bc_contrast)
+        return (adjusted * 255.0).astype(np.uint8)
 
     if stats is None:
         raise ValueError("Stats required for normalization")
@@ -180,10 +218,11 @@ def scale_to_uint8(img: np.ndarray, method: str, stats: Tuple[float, float] | No
     if vmax <= vmin:
         return np.zeros_like(img, dtype=np.uint8)
 
-    img = img.astype(np.float32)
-    img = (img - vmin) / (vmax - vmin)
-    img = np.clip(img, 0, 1)
-    return (img * 255).astype(np.uint8)
+    base = img.astype(np.float32)
+    base = (base - vmin) / (vmax - vmin)
+    base = np.clip(base, 0, 1)
+    adjusted = apply_imagej_bc(base, bc_brightness, bc_contrast)
+    return (adjusted * 255.0).astype(np.uint8)
 
 
 def build_rgb(
@@ -192,24 +231,30 @@ def build_rgb(
     normalize: str,
     bf_stats: Tuple[float, float] | None,
     label_stats: List[Tuple[float, float]] | None,
+    bf_bc: Tuple[float, float],
+    label_bcs: List[Tuple[float, float]],
 ) -> np.ndarray:
     """Combine brightfield and label channels into RGB."""
     h, w = brightfield.shape
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
 
-    bf_u8 = scale_to_uint8(brightfield, normalize, bf_stats)
+    bf_brightness, bf_contrast = bf_bc
+    bf_u8 = scale_to_uint8(brightfield, normalize, bf_stats, bf_brightness, bf_contrast)
     rgb[..., 0] = bf_u8
     rgb[..., 1] = bf_u8
     rgb[..., 2] = bf_u8
 
     if labels and label_stats is None:
         raise ValueError("Label stats required")
+    if len(label_bcs) != len(labels):
+        raise ValueError("Label B/C overrides must align with labels")
 
     for i, spec in enumerate(labels):
         if spec.image is None:
             raise ValueError(f"Label '{spec.name}' has no image data")
         ch = COLOR_TO_CHANNEL[spec.color]
-        lbl_u8 = scale_to_uint8(spec.image, normalize, label_stats[i])
+        lbl_brightness, lbl_contrast = label_bcs[i]
+        lbl_u8 = scale_to_uint8(spec.image, normalize, label_stats[i], lbl_brightness, lbl_contrast)
         rgb[..., ch] = np.clip(
             rgb[..., ch].astype(np.uint16) + lbl_u8.astype(np.uint16), 0, 255
         ).astype(np.uint8)
@@ -253,6 +298,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stat-stride", type=int, default=1, help="Frame stride for stats sampling")
     p.add_argument("--max-samples", type=int, default=1_000_000, help="Max samples per channel for stats")
     p.add_argument(
+        "--bc-brightness",
+        type=float,
+        default=50.0,
+        help=(
+            "ImageJ-style brightness percentage (0..100). "
+            "50 is neutral, 100 shifts the transfer function fully to the left."
+        ),
+    )
+    p.add_argument(
+        "--bc-contrast",
+        type=float,
+        default=50.0,
+        help=(
+            "ImageJ-style contrast percentage (0..100). "
+            "50 is neutral, 100 approaches infinite slope."
+        ),
+    )
+    p.add_argument(
+        "--bc-channel",
+        action="append",
+        default=[],
+        help=(
+            "Per-channel B/C override: TARGET:BRIGHTNESS:CONTRAST. "
+            "TARGET can be brightfield, a label name, or a channel index. "
+            "Can be repeated; last matching override wins."
+        ),
+    )
+    p.add_argument(
         "--output-structure",
         choices=["mirror", "flat"],
         default="mirror",
@@ -267,6 +340,111 @@ def iter_tiff_files(path: Path) -> List[Path]:
     return sorted(path.rglob("*.tif")) + sorted(path.rglob("*.tiff"))
 
 
+def clamp_percent(value: float) -> float:
+    return max(0.0, min(100.0, float(value)))
+
+
+def imagej_window_from_percent(
+    default_min: float, default_max: float, brightness_pct: float, contrast_pct: float
+) -> Tuple[float, float]:
+    """Compute ImageJ-like display window from brightness/contrast percentages."""
+    value_range = default_max - default_min
+    if value_range <= 0:
+        return default_min, default_max
+
+    b = clamp_percent(brightness_pct)
+    c = clamp_percent(contrast_pct)
+
+    # ImageJ brightness convention: larger value shifts window center to lower intensities (left).
+    center = default_min + value_range * ((100.0 - b) / 100.0)
+
+    # ImageJ contrast convention around a midpoint: 50 is slope 1, 100 approaches inf, 0 approaches 0.
+    if c < 50.0:
+        slope = c / 50.0
+    elif c > 50.0:
+        denom = 100.0 - c
+        slope = float("inf") if denom <= 0 else 50.0 / denom
+    else:
+        slope = 1.0
+
+    if slope == 0.0:
+        half_width = value_range * 1e6
+    elif np.isinf(slope):
+        half_width = 0.0
+    else:
+        half_width = 0.5 * value_range / slope
+
+    return center - half_width, center + half_width
+
+
+def apply_imagej_bc(norm: np.ndarray, brightness_pct: float, contrast_pct: float) -> np.ndarray:
+    """Apply ImageJ-like brightness/contrast on normalized [0,1] data."""
+    win_min, win_max = imagej_window_from_percent(0.0, 1.0, brightness_pct, contrast_pct)
+    width = win_max - win_min
+    if width <= 1e-12:
+        # Infinite slope: threshold at the window center.
+        center = 0.5 * (win_min + win_max)
+        return (norm >= center).astype(np.float32)
+    out = (norm - win_min) / width
+    return np.clip(out, 0.0, 1.0)
+
+
+def build_channel_bc_overrides(specs: List[str], labels: List[LabelSpec]) -> List[ChannelBCOverride]:
+    label_name_keys = {}
+    for lbl in labels:
+        key = lbl.name.strip().lower()
+        if key in label_name_keys:
+            raise ValueError(
+                f"Duplicate label name '{lbl.name}' in --label list. "
+                "Use unique names when targeting --bc-channel by label name."
+            )
+        label_name_keys[key] = lbl.index
+
+    overrides: List[ChannelBCOverride] = []
+    for spec in specs:
+        target, brightness, contrast = parse_channel_bc_spec(spec)
+        target_key = target.strip().lower()
+        if target_key == "brightfield":
+            overrides.append(ChannelBCOverride("brightfield", "brightfield", brightness, contrast))
+            continue
+        if target_key in label_name_keys:
+            overrides.append(ChannelBCOverride("label", target_key, brightness, contrast))
+            continue
+        try:
+            ch_index = int(target)
+            overrides.append(ChannelBCOverride("index", ch_index, brightness, contrast))
+            continue
+        except ValueError as exc:
+            valid_labels = ", ".join(sorted(label_name_keys.keys())) if label_name_keys else "none"
+            raise ValueError(
+                f"Invalid --bc-channel target '{target}'. "
+                f"Use brightfield, one of label names [{valid_labels}], or an integer channel index."
+            ) from exc
+    return overrides
+
+
+def resolve_channel_bc(
+    channel_index: int,
+    is_brightfield: bool,
+    label_name: str | None,
+    default_brightness: float,
+    default_contrast: float,
+    overrides: List[ChannelBCOverride],
+) -> Tuple[float, float]:
+    brightness = default_brightness
+    contrast = default_contrast
+    label_key = label_name.strip().lower() if label_name else None
+
+    for item in overrides:
+        if item.target_type == "brightfield" and is_brightfield:
+            brightness, contrast = item.brightness, item.contrast
+        elif item.target_type == "label" and label_key == item.target_value:
+            brightness, contrast = item.brightness, item.contrast
+        elif item.target_type == "index" and channel_index == item.target_value:
+            brightness, contrast = item.brightness, item.contrast
+    return brightness, contrast
+
+
 def sanitize_suffix_name(name: str) -> str:
     cleaned = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in name.strip())
     return cleaned.strip("_") or "label"
@@ -274,6 +452,15 @@ def sanitize_suffix_name(name: str) -> str:
 
 def main() -> None:
     args = parse_args()
+    normalize_explicit = any(
+        token == "--normalize" or token.startswith("--normalize=") for token in sys.argv[1:]
+    )
+    has_channel_bc = len(args.bc_channel) > 0
+    has_global_bc = (float(args.bc_brightness) != 50.0) or (float(args.bc_contrast) != 50.0)
+    if (has_channel_bc or has_global_bc) and (not normalize_explicit):
+        args.normalize = "minmax"
+        print("Info: B/C controls detected without explicit --normalize. Using --normalize minmax (ImageJ-like).")
+
     input_path: Path = args.input
     output_dir: Path = args.output
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -287,6 +474,7 @@ def main() -> None:
             color = DEFAULT_LABEL_COLORS[i]
         label_specs.append(LabelSpec(name=name, index=index, color=color))
     label_suffix = f"_{sanitize_suffix_name(label_specs[0].name)}" if label_specs else ""
+    channel_bc_overrides = build_channel_bc_overrides(args.bc_channel, label_specs)
 
     files = iter_tiff_files(input_path)
     if not files:
@@ -307,6 +495,31 @@ def main() -> None:
                 raise IndexError(
                     f"Label '{spec.name}' channel index {spec.index} out of range for {tif_path.name} (C={c})"
                 )
+        for item in channel_bc_overrides:
+            if item.target_type == "index" and (item.target_value < 0 or item.target_value >= c):
+                raise IndexError(
+                    f"--bc-channel index {item.target_value} out of range for {tif_path.name} (C={c})"
+                )
+
+        bf_bc = resolve_channel_bc(
+            channel_index=args.brightfield,
+            is_brightfield=True,
+            label_name=None,
+            default_brightness=args.bc_brightness,
+            default_contrast=args.bc_contrast,
+            overrides=channel_bc_overrides,
+        )
+        label_bcs = [
+            resolve_channel_bc(
+                channel_index=spec.index,
+                is_brightfield=False,
+                label_name=spec.name,
+                default_brightness=args.bc_brightness,
+                default_contrast=args.bc_contrast,
+                overrides=channel_bc_overrides,
+            )
+            for spec in label_specs
+        ]
 
         p_low, p_high = resolve_percentiles(
             args.normalize, args.p_low, args.p_high, args.imagej_sat
@@ -369,9 +582,24 @@ def main() -> None:
                             )
                         )
 
-                    rgb = build_rgb(brightfield, labels_for_frame, args.normalize, bf_stats, label_stats)
+                    rgb = build_rgb(
+                        brightfield,
+                        labels_for_frame,
+                        args.normalize,
+                        bf_stats,
+                        label_stats,
+                        bf_bc,
+                        label_bcs,
+                    )
                 else:
-                    bf_u8 = scale_to_uint8(brightfield, args.normalize, bf_stats)
+                    bf_brightness, bf_contrast = bf_bc
+                    bf_u8 = scale_to_uint8(
+                        brightfield,
+                        args.normalize,
+                        bf_stats,
+                        bf_brightness,
+                        bf_contrast,
+                    )
                     rgb = np.stack([bf_u8, bf_u8, bf_u8], axis=-1)
 
                 writer.append_data(np.ascontiguousarray(rgb))

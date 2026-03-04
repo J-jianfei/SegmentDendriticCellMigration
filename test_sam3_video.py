@@ -34,9 +34,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
+        action="append",
         type=str,
-        default=DEFAULT_PROMPT,
-        help="Text prompt used for segmentation.",
+        default=[],
+        help="Text prompt used for segmentation. Repeat --prompt to use multiple prompts.",
     )
     parser.add_argument("--device", type=str, default="cpu", help="Inference device, e.g. cpu or cuda:0.")
     parser.add_argument("--conf", type=float, default=0.5, help="Confidence threshold.")
@@ -115,10 +116,18 @@ def build_video_writer(path: Path, fps: float, frame_size: tuple[int, int], ext:
     )
 
 
+def class_name_from_result(names: dict | list | tuple | None, class_id: int) -> str:
+    if isinstance(names, dict):
+        return str(names.get(class_id, class_id))
+    if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+        return str(names[class_id])
+    return str(class_id)
+
+
 def process_video(
     video_path: Path,
     predictor: SAM3VideoSemanticPredictor,
-    prompt: str,
+    prompts: list[str],
     pred_suffix: str,
     pred_ext: str,
 ) -> tuple[Path, Path]:
@@ -127,7 +136,7 @@ def process_video(
     fps = get_video_fps(video_path)
 
     predictor.inference_state = {}
-    results = predictor(source=str(video_path), text=[prompt], stream=True)
+    results = predictor(source=str(video_path), text=prompts, stream=True)
 
     video_writer = None
     fov_width = None
@@ -139,6 +148,8 @@ def process_video(
                 [
                     "frame_index",
                     "obj_id",
+                    "class_id",
+                    "class_name",
                     "x",
                     "y",
                     "width",
@@ -159,6 +170,7 @@ def process_video(
                 if boxes is not None and len(boxes) > 0:
                     xyxy = boxes.xyxy.cpu().numpy()
                     scores = boxes.conf.cpu().numpy()
+                    cls_ids = boxes.cls.cpu().numpy().astype(int).tolist()
                     track_ids = boxes.id
                     if track_ids is None:
                         obj_ids = list(range(len(xyxy)))
@@ -171,6 +183,8 @@ def process_video(
                             [
                                 frame_idx,
                                 int(obj_ids[i]),
+                                int(cls_ids[i]),
+                                class_name_from_result(result.names, int(cls_ids[i])),
                                 float(x1),
                                 float(y1),
                                 float(x2 - x1),
@@ -196,6 +210,9 @@ def process_video(
 def main() -> int:
     args = parse_args()
     pred_ext = normalize_ext(args.pred_ext)
+    prompts = [p.strip() for p in args.prompt if p and p.strip()]
+    if not prompts:
+        prompts = [DEFAULT_PROMPT]
     if not args.model.exists():
         raise FileNotFoundError(f"Model not found: {args.model}")
     if not args.video_root.exists():
@@ -212,7 +229,7 @@ def main() -> int:
     for i, video_path in enumerate(videos, start=1):
         print(f"[{i}/{len(videos)}] Processing: {video_path}")
         try:
-            csv_path, pred_path = process_video(video_path, predictor, args.prompt, args.pred_suffix, pred_ext)
+            csv_path, pred_path = process_video(video_path, predictor, prompts, args.pred_suffix, pred_ext)
             print(f"  saved CSV: {csv_path}")
             print(f"  saved predictions: {pred_path}")
         except Exception as exc:
